@@ -24,7 +24,7 @@ from sklearn import decomposition
 
 import pyeto
 import pyproj as proj
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, Point
 import rasterio as rio
 import rasterio.plot as riop
 import rasterio.mask as riom
@@ -45,9 +45,7 @@ from hda import Client
 
 import logging
 import sys
-#from fmch.log_to_file import get_logger
-#logger = get_logger(__name__)
-
+from zipfile import ZipFile
 
 logger = logging.getLogger('hsicos')
 logger.handlers = []
@@ -60,25 +58,14 @@ file_handler = logging.FileHandler('/home/hermanns/Work/fluxes/hsicos.log')
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(f)
 stdout_handler = logging.StreamHandler(sys.stdout)
-stdout_handler.setLevel(logging.WARNING)
+stdout_handler.setLevel(logging.INFO)
 stdout_handler.setFormatter(f)
 
 logger.addHandler(file_handler)
 logger.addHandler(stdout_handler)
 logger.info('Running HSICOS module')
 
-'''
-root = logging.getLogger()
-root.setLevel(logging.DEBUG)
-
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-root.addHandler(handler)
-'''
-
-def build_icos_meta():
+def _build_icos_meta():
     '''
     Function to build a geodataframe containing metadata about a number of ICOS
     sites in different European countries. Includes infos about ecosystem type,
@@ -149,13 +136,13 @@ def build_icos_meta():
          'long_name': ['Loobos', 'Torgnon', 'San Rossore 2', 'Lison', 'Castelporziano2', #5
                        'Borgo Cioffi', 'Hesse', 'Fontainebleau-Barbeau', 'Estrees-Mons A28', 'Bilos', #10
                        'Majadas del Tietar South', 'Majadas del Tietar North', #12
-                       'Albuera', 'FI-SiiTharandt', 'Wüstebach', 'Selhausen Juelich', #16
+                       'Albuera', 'Tharandt', 'Wüstebach', 'Selhausen Juelich', #16
                        'Rollesbroich', 'Oberbärenburg', 'Klingenberg', 'Hetzdorf', #20
                        'Huetelmoor', 'Grosses Bruch', 'Hainich', 'Hordorf', 'Hohes Holz', #25
                        'Grillenburg', 'Gebesee', 'Anklam', 'Trebon', 'Stitna', 'Rajec', #31
                        'Lanzhot', 'Bily Kriz forest', 'Oensingen 2', 'Lägeren', #35
                        'Früebüel', 'Davos', 'Chamau', 'Alp Weissenstein', 'Vielsalm', #40
-                       'Maasmechelen', 'Lonzee', 'Brasschaat', 'Siikaneva', 'Hyytiala', #45
+                       'Maasmechelen', 'Lonzee', 'Brasschaat', 'Siikaneva', 'Hyytiälä', #45
                        'Degerö', 'Hyltemossa', 'Norunda', 'Svartberget', 'La Guette', #50
                        'Mejusseaume', 'Voulundgaard', 'Toulouse', 'Skjern', 'Gludsted Plantage', #55
                        'Lamasquere'],
@@ -234,7 +221,7 @@ def _fnv(values, target):
                        'Will proceed with max WL.')
     if target < min(values) - 3:
         logger.warning('Min wavelength is {} and target is {}.'.format(min(values), target) +
-                       'Will proceed with max WL.')
+                       'Will proceed with min WL.')
     if type(values) == list:
         idx = min(range(len(values)), key=lambda i:abs(values[i]-target))
     elif type(values) == np.ndarray:
@@ -272,7 +259,17 @@ def _local_mask(raster, transform, shapes, **kwargs):
     return output, out_trans
 
 def desis_crop(path, mask, indexes = None):
-    '''use python indexing starting at 0'''
+    '''
+    Reads DESIS GeoTiffs and crops using rasterio.mask methods (argument
+    all_touched is always set to True).
+        
+    Args:
+        path (string): The file path of the zipped PRISMA image to be cropped.
+        mask (GeoJSON-like dict): passed to rasterio.mask.mask. Should have
+            ETRS89-extended / LAEA Europe coordinates (epsg:3035).
+        indexes (int / list of ints, optional): Indexes of the bands to be
+            included. Use Python indexing starting at 0.
+    '''
     if indexes == None:
         indexes = list(range(0, 235)) # all DESIS bands by default
     if isinstance(indexes, int):
@@ -282,7 +279,14 @@ def desis_crop(path, mask, indexes = None):
     hdr = envi.read_envi_header(path.parent / (path.stem + '.hdr'))
     wls = [float(i) for i in hdr['wavelength']]
     with rio.open(path, driver='GTiff') as src:
-        raw_cube, out_trans = riom.mask(src, shapes=mask, all_touched=True,
+        epsg = src.crs.to_epsg()
+    # (re-)project mask derived from ICOS coordinates to HSI CRS
+    crs_lam = proj.CRS.from_epsg('3035')
+    crs_utm = proj.CRS.from_epsg(epsg)
+    transf = proj.Transformer.from_crs(crs_lam, crs_utm, always_xy=True)
+    utm_mask = stransform(transf.transform, mask)
+    with rio.open(path, driver='GTiff') as src:
+        raw_cube, out_trans = riom.mask(src, shapes=[utm_mask], all_touched=True,
                                         crop=True, indexes=indexes_rio)
     if raw_cube.ndim == 2:
         out_ext = riop.plotting_extent(raw_cube, out_trans)
@@ -301,26 +305,51 @@ def desis_crop(path, mask, indexes = None):
     fp_cube = offset + gain * temp # L=OffsetOfBand+GainOfBand*DN
     fp_cube = fp_cube.astype('float32')
     
-    return fp_cube, wls, out_ext, na_val, out_trans
+    return fp_cube, wls, out_ext, na_val, out_trans, epsg
 
 def prisma_crop(path, mask, indexes = None, swir = False):
-    '''use python indexing starting at 0'''
-    with h5py.File(path, mode='r') as f:
-        vnir_wls = pd.Series(
-            np.flip(f.attrs['List_Cw_Vnir'])).drop(range(63, 66))
-        vnir_raw = f['/HDFEOS/SWATHS/PRS_L2D_HCO/Data Fields/VNIR_Cube'][:]
-        #err_mat = f['HDFEOS/SWATHS/PRS_L2D_HCO/Data Fields/VNIR_PIXEL_L2_ERR_MATRIX'][:]
-        
-        geo = {'xmin': min(f.attrs['Product_ULcorner_easting'], f.attrs['Product_LLcorner_easting']),
-               'xmax': max(f.attrs['Product_LRcorner_easting'], f.attrs['Product_URcorner_easting']),
-               'ymin': min(f.attrs['Product_LLcorner_northing'], f.attrs['Product_LRcorner_northing']),
-               'ymax': max(f.attrs['Product_ULcorner_northing'], f.attrs['Product_URcorner_northing']),
-               'proj_code': f.attrs['Projection_Id'],
-               'proj_name': f.attrs['Projection_Name'],
-               'proj_epsg': f.attrs['Epsg_Code']
-               }
-        smax = f.attrs['L2ScaleVnirMax']
-        smin = f.attrs['L2ScaleVnirMin']
+    '''
+    Reads zipped PRISMA imagery and crops using rasterio.mask methods (argument
+    all_touched is always set to True).
+    
+    Args:
+        path (string): The file path of the zipped PRISMA image to be cropped.
+        mask (GeoJSON-like dict): passed to rasterio.mask.mask. Should have
+            ETRS89-extended / LAEA Europe coordinates (epsg:3035).
+        indexes (int / list of ints, optional): Indexes of the bands to be
+            included. Use Python indexing starting at 0.
+        swir (bool, optional): If true, bands in the 1000-2500 nm range are
+            imported and concatenated with the VNIR cube.
+    '''
+    with ZipFile(path) as zf:
+        for file in zf.namelist():
+            if not file.endswith('.he5'): # optional filtering by filetype
+                logger.error('{}: Zip doesnt contain .he5 file.'.format(path))
+                continue
+            with zf.open(file) as f:
+                with h5py.File(f, mode='r') as h5f:
+                    vnir_wls = pd.Series(
+                        np.flip(h5f.attrs['List_Cw_Vnir'])).drop(range(63, 66))
+                    vnir_raw = h5f['/HDFEOS/SWATHS/PRS_L2D_HCO/Data Fields/VNIR_Cube'][:]
+                    #err_mat = h5f['HDFEOS/SWATHS/PRS_L2D_HCO/Data Fields/VNIR_PIXEL_L2_ERR_MATRIX'][:]
+                    
+                    geo = {'xmin': min(h5f.attrs['Product_ULcorner_easting'], h5f.attrs['Product_LLcorner_easting']),
+                           'xmax': max(h5f.attrs['Product_LRcorner_easting'], h5f.attrs['Product_URcorner_easting']),
+                           'ymin': min(h5f.attrs['Product_LLcorner_northing'], h5f.attrs['Product_LRcorner_northing']),
+                           'ymax': max(h5f.attrs['Product_ULcorner_northing'], h5f.attrs['Product_URcorner_northing']),
+                           'proj_code': h5f.attrs['Projection_Id'],
+                           'proj_name': h5f.attrs['Projection_Name'],
+                           'proj_epsg': h5f.attrs['Epsg_Code']
+                           }
+                    smax = h5f.attrs['L2ScaleVnirMax']
+                    smin = h5f.attrs['L2ScaleVnirMin']
+                    if swir == True:
+                        swir_wls = pd.Series(
+                            np.flip(h5f.attrs['List_Cw_Swir'])).drop(range(0, 6))
+                        swir_raw = h5f['/HDFEOS/SWATHS/PRS_L2D_HCO/Data Fields/SWIR_Cube'][:]
+                        smax_sw = h5f.attrs['L2ScaleSwirMax']
+                        smin_sw = h5f.attrs['L2ScaleSwirMin']
+                    
     rows0,_,cols0 = np.shape(vnir_raw)
     geo['xsize'] = (geo['xmax']-geo['xmin'])/cols0
     geo['ysize'] = (geo['ymax']-geo['ymin'])/rows0
@@ -331,13 +360,6 @@ def prisma_crop(path, mask, indexes = None, swir = False):
     vnir_refl = (smin + vnir_cube * (smax - smin)) / 65535
     
     if swir == True:
-        with h5py.File(path, mode='r') as f:
-            # Discard faulty & overlapping bands
-            swir_wls = pd.Series(
-                np.flip(f.attrs['List_Cw_Swir'])).drop(range(0, 6))
-            swir_raw = f['/HDFEOS/SWATHS/PRS_L2D_HCO/Data Fields/SWIR_Cube'][:]
-            smax_sw = f.attrs['L2ScaleSwirMax']
-            smin_sw = f.attrs['L2ScaleSwirMin']
         swir_cube = np.einsum('kli->kil', np.flip(swir_raw, 1))
         swir_refl = (smin_sw + swir_cube * (smax_sw - smin_sw)) / 65535
         
@@ -358,21 +380,29 @@ def prisma_crop(path, mask, indexes = None, swir = False):
     rows, cols = np.shape(full_cube)[0:2]
 
     src_trans = rio.transform.from_bounds(*bbox, width=cols, height=rows)
+    
+    # (re-)project mask derived from ICOS coordinates to HSI CRS
+    epsg = geo['proj_epsg']
+    crs_lam = proj.CRS.from_epsg('3035')
+    crs_utm = proj.CRS.from_epsg(epsg)
+    transf = proj.Transformer.from_crs(crs_lam, crs_utm, always_xy=True)
+    utm_mask = stransform(transf.transform, mask)
     # In rio.Affine: last value is ymax, not ymin!
-    fp_cube, out_trans = _local_mask(full_cube, src_trans, mask, crop=True,
+    fp_cube, out_trans = _local_mask(full_cube, src_trans, [utm_mask], crop=True,
                                     all_touched=True, indexes=indexes_rio)
     out_ext = riop.plotting_extent(fp_cube, out_trans)
     na_val = 0
     
-    return fp_cube, wls, out_ext, na_val, out_trans
+    return fp_cube, wls, out_ext, na_val, out_trans, epsg
+
 
 class HSICOS():
     
     def __init__(self, wdir, img_csv, do_mkdir = False, out_dir = False, era_blh = []):
         '''
         Args:
-            wdir (str): The directory where BSQ files and the GeoPackage with
-                ROI bounding box are located.
+            wdir (string): The directory where BSQ files and the GeoPackage
+                with ROI bounding box are located.
             img_csv (string): Name of the metadata CSV file that contains key
                 info about the imagery to be processed. Required columns for
                 cropping are:
@@ -386,9 +416,9 @@ class HSICOS():
                 tiated to match ICOS standards (e.g. conversion of TZ from UTC
                 to CET)
             do_mkdir (bool, optional): If true, the output directory is created.
-            out_dir (string, optional): Set a custom name for the working folder,
-                e.g. to continue previously produced results. If unused, a
-                generic output directory name will be used.
+            out_dir (string, optional): Set a custom name for the working
+                folder, e.g. to continue previously produced results. If
+                unused, a generic output directory name will be used.
         '''
         self._wdir = Path(wdir)
         self.icos_dir = self._wdir / 'fluxes/level2'
@@ -420,7 +450,7 @@ class HSICOS():
         try: # read or build icos sites metadata table
             self.icos_db = gpd.read_file(self.icos_dir.parent / 'flx_sites.gpkg', driver='GPKG')
         except ferr.CPLE_OpenFailedError:
-            self.icos_db = build_icos_meta(save=False)
+            self.icos_db = _build_icos_meta(save=False)
         
         # get sensor type from ID formatting
         if '_' in self.img_db.dataTakeID.iloc[0]:
@@ -444,69 +474,90 @@ class HSICOS():
             except FileExistsError:
                 print('Output directory already exists')
         
+        # Aggregated geom info for ICOS sites is loaded if available
+        flx_loc_path = self.img_dir / '{}_hsicos_crs_loc.csv'.format(self.sensor)
+        if flx_loc_path.exists():
+            flx_df = pd.read_csv(flx_loc_path, on_bad_lines='skip')
+            self.flx_loc = gpd.GeoDataFrame(flx_df, geometry=gpd.points_from_xy(
+                flx_df.lon, flx_df.lat), crs='EPSG:4326')
+            logger.info('CRS and location overview of ICOS sites loaded to self.flx_loc.')
+        
+        # check existing cropped PPI files
+        self.img_db['ppi_file'] = ''
+        ppi_dir = self.img_dir.parent / 'Copernicus/S2PPI'
+        ppif_list = [x.name for x in list(ppi_dir.glob('*VI_PPI*.tif'))]
+        
+        for fname in ppif_list:
+            self.img_db.loc[(self.img_db.name == fname[-25:-19]) &
+                            (self.img_db.dataTakeID == fname[-18:-4]), 'ppi_file'] = fname
+        logger.info('S2 PPI images locally available for {} data takes.'\
+                    .format(len(self.img_db.loc[self.img_db.ppi_file != '', :])))
+        
+
+        
     
 ### QUALITY CHECKS ############################################################
 
-    def import_crs_geom(self, icos_list):
+    def crs_and_cropping(self, icos_list, zip_path = None, date = None,
+                        overwrite = False, save_csv = False):
         '''
-        Imports geospatial information for ICOS sites into the class. Location
-        will be imported from ICOS L2 data in WGS84. For later conversions to
-        metric coordinates, the matching projected CRS is imported from the
-        hyperspectral data.
+        Imports geospatial information for ICOS sites into the class and crops
+        HSI to a 3km buffer around the site. Location is imported from ICOS
+        data in WGS84. Projected CRS is imported from the hyperspectral data
+        inside the PRISMA_crop function. It is assumed that all imagery for a
+        single ICOS site has the same CRS (which might not be the case in very
+        rare cases). Crops are saved as GeoTIFF in 'img_dir'.
         
         Args:
-            icos_list (string or list of strings): Abbreviation of the ICOS
+            icos_list (string / list of strings): Abbreviation of the ICOS
                 site(s) for which geometry information will be collected.
+            zip_path (string, optional): Location of zipped PRISMA imagery,
+                e.g. if located on external drive instead of self.img_dir.
+            date (string, optional): Date of image to be cropped. If no date is
+                supplied, all available dates for the site will be processed.
+            overwrite (bool, optional): If true, imagery for which a cropped
+                file already exists will not be skipped.
+            save_csv (bool, optional): If true, the collected CRS & geographic
+                information will be saved inside the imagery folder.
+
         '''
+        if isinstance(icos_list, str):
+            icos_list = [icos_list]
+        
+        if zip_path:
+            img_dir = Path(zip_path)
+        else:
+            img_dir = self.img_dir
+        
         crslist = [0]*len(icos_list)
         lats = [0]*len(icos_list)
         lons = [0]*len(icos_list)
         for j, site in enumerate(icos_list):
-            datelist = self.img_db.loc[self.img_db.name == site, 'startdate'].dt.date
-            dtakes = self.img_db.loc[datelist.index, 'dataTakeID']
-            filemissing = [-99]*len(datelist)
-            if self.sensor == 'DESIS':
-                for i, dtake in enumerate(dtakes): # little loop to check imagery existence
-                    nfiles = len([x for x in self.img_dir.glob(
-                        '*' + dtake + '*SPECTRAL_IMAGE.tif')])
-                    if nfiles == 0:
-                        nfiles = len([x for x in self.img_dir.glob(
-                            '*{}_{}_6km_crop.tif'.format(dtake, site))])
-                    filemissing[i] = nfiles
-            elif self.sensor == 'PRISMA':
-                for i, dtake in enumerate(dtakes):
-                    nfiles = len([x for x in self.img_dir.glob('*' + dtake + '*.he5')])
-                    if nfiles == 0:
-                        nfiles = len([x for x in self.img_dir.glob(
-                            '*{}_{}_6km_crop.tif'.format(dtake, site))])
-                    filemissing[i] = nfiles
-            nm_ix = np.where(np.array(filemissing) > 0)[0]
-            if len(nm_ix) == 0:
-                logger.warning('No image found for site {}. '.format(site) +
-                               'CRS value set to 0.')
+            if date:
+                datelist = self.img_db.loc[(self.img_db.name == site) &
+                                           (self.img_db.date == date), 'startdate'].dt.date
             else:
-                if self.sensor == 'DESIS': # CRS is identical for images from 1 ICOS site. 1st image CRS loaded as default.
-                    try:
-                        with rio.open(self.img_dir / 'DESIS-HSI-L2A-DT0{}_{}_6km_crop.tif'\
-                                      .format(dtakes.iloc[nm_ix[0]], site), driver='GTiff') as src:
-                            crslist[j] = src.crs
-                    except RasterioIOError:                        
-                        fnames0 = [x for x in self.img_dir.glob(
-                            '*{}*SPECTRAL_IMAGE.tif'.format(dtakes.iloc[nm_ix[0]]))]
-                        with rio.open(fnames0[0], driver='GTiff') as src:
-                            crslist[j] = src.crs
-                elif self.sensor == 'PRISMA':
-                    try:
-                        with rio.open(self.img_dir / 'PRS_L2D_STD_{}_{}_6km_crop.tif'\
-                                      .format(dtakes.iloc[nm_ix[0]], site), driver='GTiff') as src:
-                            crslist[j] = src.crs
-                    except RasterioIOError:
-                        fnames0 = [x for x in self.img_dir.glob(
-                            '*' + dtakes.iloc[nm_ix[0]] + '*.he5')]
-                        with h5py.File(fnames0[0], mode='r') as src:
-                            crslist[j] = proj.CRS.from_epsg(src.attrs['Epsg_Code'])
+                datelist = self.img_db.loc[self.img_db.name == site, 'startdate'].dt.date
+            dtakes = self.img_db.loc[datelist.index, 'dataTakeID']
             
-            # Load flux location for ROI clipping before looping
+            if self.sensor == 'DESIS':
+                img_paths = [list((self.img_dir).glob('*' + dt + '*SPECTRAL*.tif')) for dt in dtakes]
+                crop_paths = [self.img_dir / 'DESIS-HSI-L2A-DT{}_{}_6km_crop.tif'.format(
+                    dt.zfill(14), site) for dt in dtakes]
+            elif self.sensor == 'PRISMA':
+                img_paths = [list((img_dir).glob('*' + dt + '*.zip')) for dt in dtakes]
+                crop_paths = [self.img_dir / 'PRS_L2D_STD_{}_{}_6km_crop.tif'.format(
+                    dt, site) for dt in dtakes]
+                
+            crop_exists = [p.is_file() for p in crop_paths]
+            if all(crop_exists):
+                logger.warning('{}: All HSI are already cropped.'.format(site))
+                return
+            
+            no_crop = [i for (i, v) in zip(dtakes, crop_exists) if not v]
+            logger.info('{}: No cropped image found for data takes {}.'.format(site, no_crop))
+            
+            # 1) Load flux locations
             cols = ['VARIABLE', 'DATAVALUE']
             icos_exp = self.icos_dir / ('ICOSETC_{}_FLUXES_INTERIM_L2.csv'.format(site))
             if icos_exp.exists(): # Create file name template for single ICOS site
@@ -521,106 +572,85 @@ class HSICOS():
             lats[j] = site_info.loc[site_info.VARIABLE == 'LOCATION_LAT',
                                'DATAVALUE'].astype(float).item()
             lons[j] = site_info.loc[site_info.VARIABLE == 'LOCATION_LONG',
-                               'DATAVALUE'].astype(float).item()
- 
+                               'DATAVALUE'].astype(float).item()            
+            
+            flx_loc = gpd.GeoSeries(data=[Point(lons[j], lats[j])], crs='EPSG:4326').to_crs(3035)
+            flx_roi_crop = flx_loc.buffer(3000) # lambert -> buffer in meters
+            box_geom_crop = geometry.box(*flx_roi_crop.total_bounds)
+            # 2) Load CRS & crop
+            cubes = [0]*len(img_paths)
+            wlss = [0]*len(img_paths)
+            blength = []
+            img_crss = [0]*len(img_paths)
+            itransforms = [0]*len(img_paths)
+            for i, path in enumerate(img_paths):
+                if crop_exists[i] & (overwrite == False): # only process paths for which cropped imagery is missing:
+                    continue
+                if len(path) == 0:
+                    logger.info('{}: The {} image with dataTakeID {} could not be found.'\
+                                .format(site, self.sensor, dtakes.iloc[i]))
+                    continue
+                elif len(path) > 1:
+                    raise ValueError('dataTakeID {} not unique. Please investigate.'\
+                                     .format(dtakes.iloc[i]))
+                if self.sensor == 'DESIS': # cubes = 6km crops for saving subset as GeoTIFF
+                        cubes[i], wlss[i], _, na_val, itransforms[i], img_crss[i] =\
+                            desis_crop(path[0], box_geom_crop)
+                elif self.sensor == 'PRISMA':
+                    cubes[i], wlss[i], _, na_val, itransforms[i], img_crss[i] =\
+                        prisma_crop(path[0], box_geom_crop, swir=True) # SWIR should always be saved in cropped TIFF
+                cubes[i] = np.round(cubes[i], 6)
+                blength.append(len(wlss[i])) #usually for DESIS 235, for PRISMA 63 (VNIR) / 230 (VSWIR).
+            if len(set(blength)) > 1:
+                raise ValueError('{}: Wavelengths are not identical for all images. '.format(site) +
+                                 'Wavelengths by order in img_db: {}'.format(blength))
+            print(img_crss)
+            img_crss = [x for x in img_crss if x != 0] # remove zeros from skipped images
+            if len(img_crss) == 0:
+                logger.info('{}: No HSI to be processed! Skipping site.'.format(site))
+                continue
+            elif len(set(img_crss)) > 1:
+                logger.error('{}: CRS is not identical for all images!'.format(site))
+            # unique CRS for all images (usually CRS will be unique across images from a single ICOS site)
+            epsg = pd.Series(img_crss).value_counts().idxmax()
+            crs_utm = proj.CRS.from_epsg(epsg)
+            for i, cube in enumerate(cubes):
+                if not isinstance(cube, np.ndarray): # only process cubes that could be loaded in first inner loop
+                    continue
+                rows, cols, b = np.shape(cube) # dimension order will be changed back to [b, y, x] when reading with rasterio
+                ometa = {'driver': 'GTiff',
+                         'dtype': 'float32',
+                         'interleave': 'band',
+                         'nodata': na_val,
+                         'width': cols,
+                         'height': rows,
+                         'count': b,
+                         'crs': crs_utm,
+                         'transform': itransforms[i]}
+                logger.info('saving crop of data take {} with CRS - EPSG:{}.'\
+                            .format(dtakes.iloc[i], epsg))
+                wls_string = [str(w) for w in wlss[i]]
+                with rio.open(crop_paths[i], 'w', **ometa) as dst:
+                    for k in range(0, b):
+                        dst.write_band(k+1, cube[:,:,k])
+                        dst.set_band_description(k+1, wls_string[k])
+
+            crslist[j] = crs_utm.to_epsg()
+        
         flx_df = pd.DataFrame(list(zip(icos_list, crslist, lons, lats)),
                               columns=['name', 'sensorcrs', 'lon', 'lat'])
+        if save_csv == True:
+            flx_loc_path = self.img_dir / '{}_hsicos_crs_loc.csv'.format(self.sensor)
+            flx_df.to_csv(flx_loc_path, index=False)
         self.flx_loc = gpd.GeoDataFrame(flx_df, geometry=gpd.points_from_xy(
             flx_df.lon, flx_df.lat), crs='EPSG:4326')
         
-        return
-    
-    
-    def crop_hsi_6km(self, icos_site, date = None):
-        '''
-        Crops HSI to a 3km buffer around tower location and saves as GeoTIFF.
-        
-        Args:
-            icos_site (string): Abbreviation of the ICOS site.
-            datelist (pandas.Series): Dates of available imagery for the
-                selected ICOS site.
-            save_crop (bool, optional): If true, cropped imagery is saved as
-                GeoTIFF in 'img_dir'.
-
-        '''
-        if date:
-            datelist = self.img_db.loc[(self.img_db.name == icos_site) &
-                                       (self.img_db.date == date), 'startdate'].dt.date
-        else:
-            datelist = self.img_db.loc[self.img_db.name == icos_site, 'startdate'].dt.date
-        dtakes = self.img_db.loc[datelist.index, 'dataTakeID']
-        #datetimes = self.img_db.loc[datelist.index, 'startdate'].dt.strftime('%Y-%m-%d %H:%M')
-        
-        if self.sensor == 'DESIS':
-            img_paths = [list((self.img_dir).glob('*' + dt + '*SPECTRAL*.tif')) for dt in dtakes]
-            crop_paths = [self.img_dir / 'DESIS-HSI-L2A-DT{}_{}_6km_crop.tif'.format(
-                dt.zfill(14), icos_site) for dt in dtakes]
-        elif self.sensor == 'PRISMA':
-            img_paths = [list((self.img_dir).glob('*' + dt + '*.he5')) for dt in dtakes]
-            crop_paths = [self.img_dir / 'PRS_L2D_STD_{}_{}_6km_crop.tif'.format(
-                dt, icos_site) for dt in dtakes]
-            
-        crop_exists = [p.is_file() for p in crop_paths]
-        if all(crop_exists):
-            logger.info('All HSI for ICOS site {} are already cropped.'.format(icos_site))
-            return
-        
-        no_crop = [i for (i, v) in zip(dtakes, crop_exists) if not v]
-        logger.info('No cropped image found for data takes {}.'.format(no_crop))
-        
-        crs_utm = self.flx_loc.loc[self.flx_loc.name == icos_site, 'sensorcrs'].item()
-        # Local UTM coordinates used for cropping, modeled geoms are in Lambert EA
-        flx_loc = self.flx_loc.loc[self.flx_loc.name == icos_site,
-                                   'geometry'].to_crs(crs_utm)
-        flx_roi_crop = flx_loc.buffer(3000)
-        box_geom_crop = geometry.box(*flx_roi_crop.total_bounds)
-
-        cubes = [0]*len(datelist)
-        wlss = [0]*len(datelist)
-        blength = []
-        
-        for i,path in enumerate(img_paths):
-            if crop_exists[i]: # only process paths for which cropped imagery is missing:
-                continue
-            if len(path) == 0: # next iteration if no file can be located for the data take
-                logger.warning('The {} image with dataTakeID {} could not be found.'\
-                                 .format(self.sensor, dtakes.iloc[i]))
-                continue
-            elif len(path) > 1:
-                raise ValueError('dataTakeID {} not unique. Please investigate.'\
-                                 .format(dtakes.iloc[i]))
-            if self.sensor == 'DESIS': # cubes = 6km crops for saving subset as GeoTIFF
-                cubes[i], wlss[i], _, na_val, itrans = desis_crop(
-                    path[0], [box_geom_crop])
-            elif self.sensor == 'PRISMA':
-                cubes[i], wlss[i], _, na_val, itrans = prisma_crop(
-                    path[0], [box_geom_crop], swir=True) # SWIR should always be saved in cropped TIFF
-            blength.append(len(wlss[i])) #usually for DESIS 235, for PRISMA 63 (VNIR) / 230 (VSWIR).
-            rows, cols, b = np.shape(cubes[i]) # dimension order will be changed back to [b, y, x] when reading with rasterio
-            ometa = {'driver': 'GTiff',
-                     'dtype': 'float32',
-                     'interleave': 'band',
-                     'nodata': na_val,
-                     'width': cols,
-                     'height': rows,
-                     'count': b,
-                     'crs': crs_utm,
-                     'transform': itrans}
-            logger.info('saving crop of data take {} with rows: {}, cols: {}, bands: {}.'\
-                        .format(dtakes.iloc[i], rows, cols, b))
-            wls_string = [str(w) for w in wlss[i]]
-            with rio.open(crop_paths[i], 'w', **ometa) as dst:
-                for j in range(0, b):
-                    dst.write_band(j+1, cubes[i][:,:,j])
-                    dst.set_band_description(j+1, wls_string[j])
-        if len(set(blength)) != 1:
-            raise ValueError('{}: Wavelengths are not identical for all images. '.format(icos_site) +
-                             'Wavelengths by order in img_db: {}'.format(blength))
         return
         
 
     def hsi_qc(self, icos_site, clip_dist = [1.0, 3.0], date = None, save = False):
         '''
+        TODO: adjust to 6km TIFFs and zipped .he5 files!!!
         Quality checking function for DESIS & PRISMA imagery. Checks if imagery
         covers flux site and is not located on no data edge of an image. Gen-
         erates quicklook graphics to examine potential atmospheric disturbances.
@@ -673,9 +703,7 @@ class HSICOS():
                 filestatus_l[j] = ['missing'] * len(datelist)
                 continue # early end of iteration if no data found 
             
-            crs = self.flx_loc.loc[self.flx_loc.name == site, 'sensorcrs'].item()
-            flx_loc = self.flx_loc.loc[self.flx_loc.name == site, 'geometry'].to_crs(crs)
-            #flx_loc = gpd.GeoSeries(Point(lon, lat), crs='EPSG:4326').to_crs(crs)
+            flx_loc = self.flx_loc.loc[self.flx_loc.name == site, 'geometry']
             flx_roi = flx_loc.buffer((max(clip_dist)+1)*1000)
             box_geom = geometry.box(*flx_roi.total_bounds)
             flx_roi_na = flx_loc.buffer(1000) # 1000 m buffer for checking NaN ratio
@@ -702,8 +730,8 @@ class HSICOS():
                             desis_ql, _ = riom.mask(src, shapes=[box_geom], crop=True, indexes=[3,2,1])
                         #out_ext = riop.plotting_extent(desis_ql[0], _)
                         quality_ql = np.einsum('kli->lik', desis_ql)
-                        desis_cube, wls, out_ext, na_val, itrans = desis_crop(
-                            fnames[1], [box_geom])
+                        desis_cube, wls, out_ext, na_val, itrans, _ = desis_crop(
+                            fnames[1], box_geom)
                         
                         na_rate_plot = (desis_cube == na_val).sum(axis=2) / desis_cube.shape[2]
                         
@@ -716,8 +744,8 @@ class HSICOS():
                         pp = [2, 3, 27, 18, True, True]
                         titles = ['RGB', 'NA rate', 'Shadow', 'Haze', 'Clouds']
                     elif self.sensor == 'PRISMA':
-                        prisma_cube, wls, out_ext, na_val, itrans = \
-                            prisma_crop(fnames[0], [box_geom])
+                        prisma_cube, wls, out_ext, na_val, itrans, _ = \
+                            prisma_crop(fnames[0], box_geom)
                         rows, cols, b = np.shape(prisma_cube)
                         prisma_cubeT = prisma_cube.reshape(-1,b)
                         prisma_rgb = HSI2RGB(wls, prisma_cubeT, rows, cols, 50, 0.0002)
@@ -895,9 +923,10 @@ class HSICOS():
                     'area': [ext.maxy, ext.minx, ext.miny, ext.maxx],
                     }
             else:
-                crs = self.flx_loc.loc[self.flx_loc.name == site, 'sensorcrs'].item()
-                flx_loc = flx_loc.to_crs(crs)
-                ext = flx_loc.buffer(0.1, cap_style=3).bounds.squeeze(axis=0)
+                epsg = self.flx_loc.loc[self.flx_loc.name == site, 'sensorcrs'].item()
+                crs_utm = proj.CRS.from_epsg(epsg)
+                flx_loc = flx_loc.to_crs(crs_utm)
+                ext = flx_loc.buffer(100, cap_style=3).bounds.squeeze(axis=0)
                 if ts == True:
                     datelist = self.img_db.loc[self.img_db.name == site,
                                                'startdate'].dt.strftime('%Y-%m-%d %H:%M').tolist()
@@ -1106,7 +1135,7 @@ class HSICOS():
         else:
             raise ValueError('Missing columns in "img_db". Please prepare the '\
                              'data frame according to documentation.')
-
+        ppi_df = self.img_db[['name', 'dataTakeID', 'ppi_file']]
         checkdate = old_img_db[['name', 'startdate']].select_dtypes(include=[np.datetime64])
         if checkdate.shape[1] == 0:
             raise ValueError('Incorrect datetime format, should be np.datetime64.')
@@ -1128,6 +1157,10 @@ class HSICOS():
         for site in self._era_blh:
             pblh_values = self._icos_era5_pblh(site, nc_name = nc_name)
             self.img_db.loc[self.img_db.name == site, 'era_pblh'] = pblh_values
+            
+        self.img_db = pd.merge(self.img_db, ppi_df, how='left',
+                               on=['name', 'dataTakeID'], suffixes=('', '_y'))
+        self.img_db.drop(self.img_db.filter(regex='_y$').columns, axis=1, inplace=True)
         
         if save is True:
             self.img_db.to_csv(self.icos_dir.parent / (img_csv[:-4] + '_f.csv'), index=False)
@@ -1225,7 +1258,7 @@ class HSICOS():
         return flx_anc_w, D_hdates, D_avg
     
 
-    def _load_icos_subset(self, icos_site, datelist, fluxvars, aggregate = None,
+    def _load_icos_subset(self, icos_site, datelist, fluxvars, aggregate = 'na',
                           ppfd_missing = [], zonal = False):
         '''
         Reads a number of ICOS level 2 CSV files (FLUXES, FLUXNET_HH, SITEINFO,
@@ -1244,7 +1277,7 @@ class HSICOS():
             fluxvars (list of strings): ICOS variable names of ecosystem fluxes
                 (CO2, radiation, ...) to be imported.
             aggregate (string): Type of aggregation of daily ICOS values, either
-                None, 'mean' or 'sum'.
+                "na", "mean" or "sum".
             ppfd_missing (list of strings, optional): ICOS sites for which PPFD
                 variable is missing and will be derived from SW_IN instead.
             zonal (bool, optional): If true, no footprints will be calculated
@@ -1256,7 +1289,7 @@ class HSICOS():
         D_avg = False
         D_default = False
         ZM = [-9999]*len(datelist)
-        missd = []
+        missd = [pd.Timestamp('19000101 00:00:00')] # return dummy
         
         dc = ['TIMESTAMP_START', 'TIMESTAMP_END']
         cols_gpp = dc + fluxvars
@@ -1319,7 +1352,7 @@ class HSICOS():
                         {var: 'sum' for var in fluxvars[:9]})
             fluxvars[:9] = ['{}_sum'.format(x) for x in fluxvars[:9]]
 
-        if aggregate:
+        if aggregate != 'na':
             flx_gpp_aggr.columns = fluxvars[:9]
             # join aggregated fluxes with unaggregated columns and add timestamp
             flx_gpp_aggr = pd.merge(flx_gpp_aggr, flx_gpp_temp[fluxvars[9:]], how='left',
@@ -1341,7 +1374,7 @@ class HSICOS():
             
         if zonal: # Only insert TS and return before FFP calc.
             icos_subset = flx_gpp_temp.reset_index(drop=True)
-            return icos_subset, fluxvars, ZM
+            return icos_subset, ZM, fluxvars, missd
         
         cols_flx = ['USTAR', 'V_SIGMA', 'MO_LENGTH', 'PBLH', 'WS', 'WD']
         cols = dc + cols_flx
@@ -1482,9 +1515,7 @@ class HSICOS():
         dtakes = self.img_db.loc[datelist.index, 'dataTakeID']
         ffp_params = [0]*len(datelist)
         
-        #crs = self.flx_loc.loc[self.flx_loc.name == icos_site, 'sensorcrs'].item()
-        #flx_loc = self.flx_loc.loc[self.flx_loc.name == icos_site, 'geometry'].to_crs(crs)
-        # Project to Lambert Azimuthal Equal Area for collection of european geometries in a single gdf
+        # Project to Lambert Azimuthal Equal Area (LAEA) for collection of european geometries in a single gdf
         crs_lam = proj.CRS.from_epsg('3035')
         flx_loc = self.flx_loc.loc[self.flx_loc.name == icos_site,
                                    'geometry'].to_crs(crs_lam)
@@ -1520,7 +1551,7 @@ class HSICOS():
                 ffp_params[i] = ffp_params[i].append(pblh)
             # In case of Nodata values in ICOS data, no FP can be calculated
             if ffp_params[i][['WS', 'PBLH', 'MO_LENGTH', 'V_SIGMA',
-                             'USTAR', 'WD']].isin([-9999]).any() | (date in [x.date for x in missd]):
+                             'USTAR', 'WD']].isin([-9999]).any() | (date in [x.date() for x in missd]):
                 geoms[i] = None
                 self.img_db.loc[self.img_db.dataTakeID == dtakes.iloc[i],
                                 'clouds'] = 'icos_na'
@@ -1543,7 +1574,7 @@ class HSICOS():
         # Prepare DF for merging with geoinformation.
         img_df = self.img_db.loc[datelist.index,
                                  ['name', 'startdate', 'date', 'dataTakeID',
-                                  'clouds']].reset_index(drop=True)
+                                  'clouds', 'ppi_file']].reset_index(drop=True)
         # Create single geopandas object holding information about geometry and observations
         geom_gdf = gpd.GeoDataFrame(data=img_df, geometry=gpd.GeoSeries(
             geoms, crs=crs_lam))
@@ -1566,7 +1597,11 @@ class HSICOS():
                 if (flx_geom_gdf[var] == flag).any():
                     if flag == 3:
                         quality = 'poor'
-                    ix = flx_geom_gdf[flx_geom_gdf[var] == flag].index.item()
+                    ix = flx_geom_gdf[flx_geom_gdf[var] == flag].index
+                    if len(ix) == 1:
+                        ix = ix.item()
+                    else:
+                        ix = ix.tolist()
                     logger.warning('{}: {} data quality for {} dataTakeID(s) {} '\
                                    .format(icos_site, var, self.sensor,
                                            dtakes.iloc[ix]) + 'is {} ({})'\
@@ -1617,8 +1652,9 @@ class HSICOS():
         elif sr == 'vswir':
             nm_max = 2500
         
-        crs_utm = self.flx_loc.loc[self.flx_loc.name == icos_site, 'sensorcrs'].item()
-        # Local UTM coordinates used for cropping, modeled geoms are in Lambert EA
+        epsg = self.flx_loc.loc[self.flx_loc.name == icos_site, 'sensorcrs'].item()
+        crs_utm = proj.CRS.from_epsg(epsg)
+        # Local UTM coordinates used for cropping, modeled geoms are in LAEA
         flx_loc = self.flx_loc.loc[self.flx_loc.name == icos_site,
                                    'geometry'].to_crs(crs_utm)
         flx_roi_plot = flx_loc.buffer(500)
@@ -1752,7 +1788,7 @@ class HSICOS():
         return flx_hsi_gdf, cube_list
 
     def hsi_geom_crop(self, icos_list, date = None, sr = 'vnir', zonal = False,
-                      upw = False, aggr = None, save = False, save_plot = False):
+                      upw = False, aggr = 'na', save = False, save_plot = False):
         '''
         Crops hyperspectral imagery to flux footprints derived from the 30-min
         interval of EC measurements at ICOS flux towers during or before the DESIS
@@ -1774,7 +1810,7 @@ class HSICOS():
                 plied with PAR from ICOS sensor data resulting in upwelling
                 radiation (UPW). Only possible for 400-700nm.
             aggr (string): Type of aggregation of daily ICOS values, either
-                None, 'mean' or 'sum'.
+                "na", "mean" or "sum".
             save (bool, optional): If true, footprint geometries are saved as
                 GeoPackage.
             save_plot (bool, optional): If true, ICOS site surroundings will be
@@ -1794,7 +1830,7 @@ class HSICOS():
                          
         t = 'upw' if upw is True else 'ref' # upwelling radiation or reflectance
         a = 'zst' if zonal is True else 'ffp' # flux footprint
-        self.ptype = {'rad': t, 'mask': a, 'sr': sr} # processing info
+        self.ptype = {'rad': t, 'mask': a, 'sr': sr, 'aggr': aggr} # processing info
         
         # seletion of productivity variables to be extracted (percentiles, partitioning)
         fluxvars0 = ['GPP_DT_VUT_05', 'GPP_DT_VUT_50', 'GPP_DT_VUT_95', 'GPP_NT_VUT_05',
@@ -1838,8 +1874,8 @@ class HSICOS():
                                  .format(dtakes.iloc[ip_check[ip_check == True].index]))
             
             # (1) Load FFP model parameters
-            icos_subset, ZM, fluxvars, missd = \
-                self._load_icos_subset(site, datelist, fluxvars0, aggr, no_ppfd, zonal)
+            icos_subset, ZM, fluxvars, missd = self._load_icos_subset(
+                site, datelist, fluxvars0, aggr, no_ppfd, zonal)
             
             # (2) Footprint modeling and geometry generation
             flx_geom_gdf = self._model_geoms(
@@ -1856,7 +1892,7 @@ class HSICOS():
             logger.info('{}: All {} images have been cropped to footprint size.'\
                         .format(site, self.sensor))
             n_na = len(flx_hsi_gdf[flx_hsi_gdf.clouds.isin(
-                ['icos_na', 'icos_gap', 'hsi_na'])])
+                ['icos_na', 'hsi_na'])])
             if n_na == len(flx_hsi_gdf):
                 logger.warning('{}: All imagery acquisition dates '.format(site) +
                                'have no ICOS or hyperspectral data available.' +
@@ -1883,23 +1919,22 @@ class HSICOS():
         self.flx_imgs = flx_imgs_c
         
         if save is True:
-            fname = ('all_sites_{}_{}'.format(self.sensor, self.ptype['sr']) +
-             '_{}_{}'.format(self.ptype['mask'], self.ptype['rad']))
-            if aggr == 'mean':
-                fname = fname + '_mean.gpkg'
-            elif aggr == 'sum':
-                fname = fname + '_sum.gpkg'
-            elif not aggr:
-                print('gpkg without aggregation!')
-                fname = fname + '.gpkg'
-            
-            flx_hsi_gdf.to_file(
-                self.out_dir / fname, driver='GPKG')
-            
+            fname = 'all_sites_{}_{}_{}_{}_{}.gpkg'\
+                .format(self.sensor, self.ptype['sr'], self.ptype['mask'],
+                        self.ptype['rad'], self.ptype['aggr'])
+            logger.info('Saving file {}'.format(fname))
+            print('Saving file: {}'.format(fname))
+            print(flx_hsi_gdf.columns)
+            flx_hsi_gdf.to_file(self.out_dir / fname, driver='GPKG')
+        no_ppi = len(flx_hsi_gdf[flx_hsi_gdf.ppi_file == ''])
+        if no_ppi > 0:
+            logger.warning('No S2 PPI images available for {} data takes'.format(no_ppi))
+            logger.debug('No PPI data takes:\n{}'.format(flx_hsi_gdf.loc[flx_hsi_gdf.ppi_file == '', 'dataTakeID']))
         return flx_hsi_gdf, flx_imgs_c
     
     
-    def load_cropped_db(self, fdir = None, sr = 'vnir', zonal = False, upw = False):
+    def load_cropped_db(self, fdir = None, sr = 'vnir', zonal = False,
+                        upw = False, aggr = 'na'):
         '''
         Load the processed, cleaned version of the imagery data base which com-
         bines ICOS flux estimates with spectrometer data cropped to flux foot-
@@ -1913,6 +1948,8 @@ class HSICOS():
                 instead of footprint estimates.
             upw (bool, optional): The GeoPackage contains upwelling radiation
                 instead of reflectance values.
+            aggr (string, optional): Type of aggregation of daily ICOS values,
+                either "na", "mean" or "sum".
         '''
         if (upw is True) & (sr != 'vis'):
             logger.info('upw is true but sr is not "vis". Since UPW ' +
@@ -1923,13 +1960,13 @@ class HSICOS():
             fdir = self.out_dir
         t = 'upw' if upw is True else 'ref' # upwelling radiation or reflectance
         a = 'zst' if zonal is True else 'ffp' # flux footprint
-        self.ptype = {'rad': t, 'mask': a, 'sr': sr} # processing info
+        self.ptype = {'rad': t, 'mask': a, 'sr': sr, 'aggr': aggr} # processing info
         
-        file = 'all_sites_{}_{}_{}_{}.gpkg'.format(self.sensor, sr, a, t)
-        logger.info('Loading file {}'.format(file))
-        print('Loading file: {}'.format(file))
+        fname = 'all_sites_{}_{}_{}_{}_{}.gpkg'.format(self.sensor, sr, a, t, aggr)
+        logger.info('Loading file {}'.format(fname))
+        print('Loading file: {}'.format(fname))
         self.flx_hsi_gdf = gpd.read_file(
-            fdir / file, driver='GPKG')
+            fdir / fname, driver='GPKG')
         self.flx_hsi_gdf['startdate'] = pd.to_datetime(
             self.flx_hsi_gdf.startdate)
         
@@ -1937,36 +1974,6 @@ class HSICOS():
 
             
 ### INCLUDE COVARIATES ########################################################
-
-    def _get_loc_calc_crs(self, icos_site):
-        '''
-        Helper function for retrieval of ICOS site geographic coordinates from
-        database and calculation of matching UTM CRS for transformations.
-        '''
-        if (self.flx_loc.name == icos_site).any():
-            flx_loc = self.flx_loc.loc[self.flx_loc.name == icos_site, 'geometry']
-        else: # backup for ICOS locations which are not in img_db
-            flx_loc = self.icos_db.loc[self.icos_db.name == icos_site, 'geometry']
-
-        lon = flx_loc.geometry.x.item()
-        if lon >= -12 and lon < -6:
-            crs = proj.CRS.from_epsg('32629')
-        elif lon >= -6 and lon < 0:
-            crs = proj.CRS.from_epsg('32630')
-        elif lon >= 0 and lon < 6:
-            crs = proj.CRS.from_epsg('32631')
-        elif lon >= 6 and lon < 12:
-            crs = proj.CRS.from_epsg('32632')
-        elif lon >= 12 and lon < 18:
-            crs = proj.CRS.from_epsg('32633')
-        elif lon >= 18 and lon < 24:
-            crs = proj.CRS.from_epsg('32634')
-        elif lon >= 24 and lon < 30:
-            crs = proj.CRS.from_epsg('32635')
-        else:
-            raise ValueError('{}: Coordinates outside of '.format(icos_site) +
-                             'usual range for ICOS sites in Europe.')
-        return flx_loc, crs
 
     def icos_ppi_get(self, icos_list, dataset = 'ST', day_range = 12,
                      datelist = None, save = True):
@@ -2000,23 +2007,38 @@ class HSICOS():
             ds = 'EO:HRVPP:DAT:SEASONAL-TRAJECTORIES'
         elif dataset == 'VI':
             ds = 'EO:HRVPP:DAT:VEGETATION-INDICES'
-        if 'ppi_file' not in self.flx_hsi_gdf.columns:
-            self.flx_hsi_gdf['ppi_file'] = '' # empty string instead of NA (np.nan is float)
+        #if 'ppi_file' not in self.flx_hsi_gdf.columns:
+        #    self.flx_hsi_gdf['ppi_file'] = '' # empty string instead of NA (np.nan is float)
         
         for site in icos_list:
             if datelist is None:
-                datetimes = self.flx_hsi_gdf.loc[self.flx_hsi_gdf.name == site, 'startdate']
+                datetimes = self.flx_hsi_gdf.loc[(self.flx_hsi_gdf.name == site) &
+                                                 (self.flx_hsi_gdf.ppi_file == ''), 'startdate']
+                n_hsi = len(self.flx_hsi_gdf[self.flx_hsi_gdf.name == site])
+                if len(datetimes) == 0:
+                    logger.info('{}: PPI data for all HSI data takes '.format(site) +
+                                 'have already been downloaded. Site will be skipped.')
+                    continue
+                elif len(datetimes) < n_hsi:
+                    logger.info('{}: Downloading PPI data for '.format(site) +
+                                '{}/{} HSI data takes.'.format(len(datetimes), n_hsi))
+                elif len(datetimes) == n_hsi:
+                    logger.info('{}: Downloading PPI data for all HSI data takes'.format(site))
             elif isinstance(datelist, pd.Series):
                 datetimes = datelist
             else:
                 raise ValueError('datelist has to be submitted as pd.Series.')
             ppi_files = [''] * len(datetimes)
-            odir = self.img_dir.parent / 'Copernicus/S2' / site
+            odir = self.img_dir.parent / 'Copernicus/S2PPI'
             odir.mkdir(parents=True, exist_ok=True)
             
-            flx_loc, crs = self._get_loc_calc_crs(site)
-            ext = flx_loc.buffer(0.0001, cap_style=3).bounds.squeeze(axis=0) # 0.2 deg!
-            flx_loc_check = flx_loc.to_crs(crs).buffer(250)
+            epsg = self.flx_loc.loc[self.flx_loc.name == site, 'sensorcrs'].item()
+            crs_utm = proj.CRS.from_epsg(epsg)
+            flx_loc = self.flx_loc.loc[self.flx_loc.name == site, 'geometry']
+            
+            ext = flx_loc.buffer(0.0001).bounds.squeeze(axis=0) # 0.0001 deg to get 1 tile only
+            flx_loc = flx_loc.to_crs(crs_utm)
+            flx_loc_check = flx_loc.buffer(250)
             box_geom_check = geometry.box(*flx_loc_check.total_bounds)
                 
             for i, ts in enumerate(pbar := tqdm(datetimes)):
@@ -2070,7 +2092,7 @@ class HSICOS():
                         else: # crs matching
                             logger.warning('site {}: {} date matches, possibly due to CRS edge case. files: {}\n'\
                                            .format(site, len(match_ix), matches_filenames[match_ix]))
-                            utm_zone = 'T' + crs.utm_zone[:2] # target CRS
+                            utm_zone = 'T' + crs_utm.utm_zone[:2] # target CRS
                             correct_crs_ix = matches_filenames[match_ix].str.contains(utm_zone)
                             if correct_crs_ix.sum() == 1: # only 1 true value
                                 ppi_files[i] = matches_filenames[match_ix][correct_crs_ix].item()
@@ -2105,17 +2127,18 @@ class HSICOS():
         
 
             datetimes = datetimes[datetimes != 0] # remove entries without match
+            dtakes = self.flx_hsi_gdf.loc[datetimes.index, 'dataTakeID'] # for UID of each PPI img
             ppi_files = [x for x in ppi_files if x] # removes empty strings
             if len(datetimes) != len(ppi_files):
                 raise ValueError('length of datetimes and ppi_files for site {} does not align.'.format(site))
     
-            ppi_files_new = ['{}_{}_PPI_{}.tif'.format(f[3:18], dataset, site) for f in ppi_files]
+            ppi_files_new = ['{}_{}_PPI_{}_{}.tif'.format(f[3:18], dataset, site, dtakes.iloc[i]) for i,f in enumerate(ppi_files)]
             for i, ts in enumerate(datetimes):
                 self.flx_hsi_gdf.loc[(self.flx_hsi_gdf.name == site) & \
                                      (self.flx_hsi_gdf.startdate == ts),
                                      'ppi_file'] = ppi_files_new[i]
             # crop & save PPI rasters
-            flx_loc_pb = flx_loc.to_crs(crs).buffer(1000)
+            flx_loc_pb = flx_loc.buffer(1000)
             box_geom = geometry.box(*flx_loc_pb.total_bounds)
             for i, f in enumerate(ppi_files):
                 with rio.open(odir / f) as src:
@@ -2136,14 +2159,15 @@ class HSICOS():
                 f.unlink()
             
         if save is True:
-            self.flx_hsi_gdf.to_file(
-                self.out_dir /\
-                ('all_sites_{}_{}'.format(self.sensor, self.ptype['sr']) +
-                 '_{}_{}.gpkg'.format(self.ptype['mask'], self.ptype['rad'])),
-                driver='GPKG')
+            fname = 'all_sites_{}_{}_{}_{}_{}.gpkg'\
+                .format(self.sensor, self.ptype['sr'], self.ptype['mask'],
+                        self.ptype['rad'], self.ptype['aggr'])
+            logger.info('Saving file {}'.format(fname))
+            print('Saving file: {}'.format(fname))
+            self.flx_hsi_gdf.to_file(self.out_dir / fname, driver='GPKG')
         return
     
-    def hsi_add_spei_ppi(self, save = False):
+    def hsi_add_spei_ppi(self, zonal = False, save = False):
         '''
         After SPEI/PPI data have been acquired and processed using the methods
         icos_ppi_get/icos_cds_get, icos_eobs_pet and the SPEI calculation in R,
@@ -2152,11 +2176,14 @@ class HSICOS():
         SPEI & PPI values.
         
         Args:
+            zonal (bool, optional): If true, PPI files will be cropped with
+                zonal geometries instead of FFPs.
             save (bool, optional): If true, the resulting data frame is saved
                 as GeoPackage.
         '''
         icos_list = self.flx_hsi_gdf.name.unique().tolist()
         spei_list = [0]*len(icos_list)
+        fdir = self.img_dir.parent / 'Copernicus/S2PPI'
         dparse = lambda x: dt.datetime.strptime(x, '%Y-%m-%d')
         for i,site in enumerate(icos_list):
             spei_list[i] = pd.read_csv(self.icos_dir / site / 'eobs_spei.csv',
@@ -2166,38 +2193,53 @@ class HSICOS():
         spei['date_str'] = spei.Date.dt.strftime('%Y-%m-%d')
     
         insert_ix = self.flx_hsi_gdf.columns.get_loc('b001')
-        if 'spei' not in self.flx_hsi_gdf.columns:
-            self.flx_hsi_gdf.insert(insert_ix, 'spei', -9999)
-        if 'ppi' not in self.flx_hsi_gdf.columns:
-            self.flx_hsi_gdf.insert(insert_ix, 'ppi', -9999)
+        if 'SPEI_365' not in self.flx_hsi_gdf.columns:
+            self.flx_hsi_gdf.insert(insert_ix, 'SPEI_365', -9999)
+        if 'PPI' not in self.flx_hsi_gdf.columns:
+            self.flx_hsi_gdf.insert(insert_ix, 'PPI', -9999)
 
         
         for site in icos_list:
-            fdir = self.img_dir.parent / 'Copernicus/S2' / site
             
             datelist = self.flx_hsi_gdf.loc[self.flx_hsi_gdf.name == site, 'date']
+            dtakes = self.flx_hsi_gdf.loc[self.flx_hsi_gdf.name == site, 'dataTakeID']
             #site_spei = spei.loc[spei.date_str.isin(datelist), ['date_str', 'SPEI365_{}'.format(site)]]
             
-            flx_loc, crs = self._get_loc_calc_crs(site)
-            ecosystem = self.icos_db.loc[self.icos_db.name == site, 'ecosystem'].item()
-            if ecosystem in ['MF', 'DBF', 'EBF', 'ENF']:
-                r = 80
-            elif ecosystem in ['GRA', 'OSH']:
-                r = 50
-            elif ecosystem == 'WET':
-                r = 40
-            elif ecosystem == 'CRO':
-                r = 30
+            epsg = self.flx_loc.loc[self.flx_loc.name == site, 'sensorcrs'].item()
+            crs_utm = proj.CRS.from_epsg(epsg)
+            flx_loc = self.flx_loc.loc[self.flx_loc.name == site, 'geometry'].to_crs(crs_utm)
+            
+            if zonal:
+                ecosystem = self.icos_db.loc[self.icos_db.name == site, 'ecosystem'].item()
+                if ecosystem in ['MF', 'DBF', 'EBF', 'ENF']:
+                    r = 80
+                elif ecosystem in ['GRA', 'OSH']:
+                    r = 50
+                elif ecosystem == 'WET':
+                    r = 40
+                elif ecosystem == 'CRO':
+                    r = 30
+                else:
+                    raise ValueError('Ecosystem {} not supported '.format(ecosystem) +
+                                     'Please update codebase.')
+                ppi_geom = flx_loc.buffer(r).item()
             else:
-                raise ValueError('Ecosystem {} not supported '.format(ecosystem) +
-                                 'Please update codebase.')
-            # PPI data is not necessarily from the same day as hyperspectral data
-            # -> using geometry from FFPs is not useful.
-            ppi_geom = flx_loc.to_crs(crs).buffer(r).item()
-            for date in datelist:
-                fpath = fdir / self.flx_hsi_gdf.loc[
-                    (self.flx_hsi_gdf.name == site) & \
+                crs_lam = proj.CRS.from_epsg('3035')
+                transf = proj.Transformer.from_crs(crs_lam, crs_utm, always_xy=True)
+
+            for i, date in enumerate(datelist):
+                if zonal:
+                    pass
+                else:
+                    lam_poly = self.flx_hsi_gdf.loc[datelist.index[i], 'geometry']
+                    ppi_geom = stransform(transf.transform, lam_poly)
+                fname = self.flx_hsi_gdf.loc[
+                    (self.flx_hsi_gdf.name == site) &
                     (self.flx_hsi_gdf.date == date), 'ppi_file'].item()
+                if len(fname) == 0:
+                    logger.error('{}: no ppi_file matching DT {}.'.format(date, dtakes.iloc[i]))
+                    continue
+                fpath = fdir / fname
                 with rio.open(fpath) as src: # ppi rasters are cropped
                     ppi, otrans = riom.mask(src, shapes=[ppi_geom], crop=True,
                                             all_touched=True, nodata=-32768,
@@ -2207,35 +2249,36 @@ class HSICOS():
                 spei_val = spei.loc[spei.date_str == date, 'SPEI365_{}'.format(site)].item()
                 ppi_val = np.nanmean(ppi, axis=(1, 0))
                 if ppi_val == 0:
-                    logger.warning('site {} - TS{}: Calculated PPI = 0'\
-                                   .format(site, date))
-                if site == 'FR-EM2':
-                    print('FR-EM2 PPI value: {}'.format(ppi_val))
+                    logger.warning('{} - TS{}: Calculated PPI = 0'.format(site, date))
                 self.flx_hsi_gdf.at[(self.flx_hsi_gdf.name == site) & \
                                     (self.flx_hsi_gdf.date == date),
-                                    'ppi'] = ppi_val
+                                    'PPI'] = ppi_val
                 # mean of cropped area for more robust ppi estimate
                 self.flx_hsi_gdf.at[(self.flx_hsi_gdf.name == site) & \
                                     (self.flx_hsi_gdf.date == date),
-                                    'spei'] = spei_val
+                                    'SPEI_365'] = spei_val
 
             # Looping over single SPEI values to ensure correct date matching
             #for ix, row in site_spei.iterrows(): # Use '.at' for single values!
             #    self.flx_hsi_gdf.at[(self.flx_hsi_gdf.name == site) & \
-            #                        (self.flx_hsi_gdf.date == row.iloc[0]), 'spei'] = row.iloc[1]
+            #                        (self.flx_hsi_gdf.date == row.iloc[0]), 'SPEI_365'] = row.iloc[1]
 
-        if (self.flx_hsi_gdf.spei == -9999).any():
+        if (self.flx_hsi_gdf.SPEI_365 == -9999).any():
             logger.error('No SPEI value was found for some acquisition dates!')
-        if (self.flx_hsi_gdf.ppi == -9999).any():
-            logger.error('No PPI value was found for some acquisition dates!')
+        if (self.flx_hsi_gdf.PPI == -9999).any():
+            logger.error('No PPI value was found for some acquisition dates! Observations will be removed.')
+            self.flx_hsi_gdf = self.flx_hsi_gdf[self.flx_hsi_gdf.ppi != -9999, :]
         if save is True:
-            self.flx_hsi_gdf.to_file(
-                self.out_dir /\
-                    ('all_sites_{}_{}'.format(self.sensor, self.ptype['sr']) +
-                     '_{}_{}_covars.gpkg'.format(self.ptype['mask'], self.ptype['rad'])),
-                    driver='GPKG')
+            fname = 'all_sites_{}_{}_{}_{}_{}_covars.gpkg'\
+                .format(self.sensor, self.ptype['sr'], self.ptype['mask'],
+                        self.ptype['rad'], self.ptype['aggr'])
+            logger.info('Saving file {}'.format(fname))
+            print('Saving file: {}'.format(fname))
+            self.flx_hsi_gdf.to_file(self.out_dir / fname, driver='GPKG')
+        return
 
-    def load_spei_ppi_db(self, fdir = None, sr = 'vnir', zonal = False, upw = False):
+    def load_spei_ppi_db(self, fdir = None, sr = 'vnir', zonal = False,
+                         upw = False, aggr = 'na'):
         '''
         Load the processed, cleaned version of the imagery data base encompas-
         sing ICOS flux estimates, spectrometer data cropped to ROIs, and co-
@@ -2249,6 +2292,8 @@ class HSICOS():
                 instead of footprint estimates.
             upw (bool, optional): The GeoPackage contains upwelling radiation
                 instead of reflectance values.
+            aggr (string, optional): Type of aggregation of daily ICOS values,
+                either "na", "mean" or "sum".
         '''
         if (upw is True) & (sr != 'vis'):
             logger.info('upw is true but sr is not "vis". Since UPW ' +
@@ -2259,11 +2304,13 @@ class HSICOS():
             fdir = self.out_dir
         t = 'upw' if upw is True else 'ref' # upwelling radiation or reflectance
         a = 'zst' if zonal is True else 'ffp' # flux footprint
-        self.ptype = {'rad': t, 'mask': a, 'sr': sr} # processing info
+        self.ptype = {'rad': t, 'mask': a, 'sr': sr, 'aggr': aggr} # processing info
         
-        self.flx_hsi_gdf = gpd.read_file(
-            fdir / ('all_sites_{}_{}'.format(self.sensor, sr) +
-             '_{}_{}_covars.gpkg'.format(a, t)), driver='GPKG')
+        fname = 'all_sites_{}_{}_{}_{}_{}_covars.gpkg'.format(self.sensor, sr, a, t, aggr)
+        logger.info('Loading file {}'.format(fname))
+        print('Loading file: {}'.format(fname))
+        
+        self.flx_hsi_gdf = gpd.read_file(fdir / fname, driver='GPKG')
         self.flx_hsi_gdf['startdate'] = pd.to_datetime(
             self.flx_hsi_gdf.startdate)
         
